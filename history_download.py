@@ -1,4 +1,5 @@
 import os
+import sys
 
 try:
     from dotenv import load_dotenv
@@ -15,11 +16,10 @@ if load_dotenv:
 api_id = int(os.environ["TG_API_ID"])
 api_hash = os.environ["TG_API_HASH"]
 
-private_channel_id = os.environ.get("TG_CHANNEL_ID")
-if private_channel_id is None:
-    private_channel_id = input("Enter channel ID: ").strip()
+if len(sys.argv) > 1:
+    private_channel_id = sys.argv[1].strip()
 else:
-    private_channel_id = private_channel_id.strip()
+    private_channel_id = input("Enter channel ID: ").strip()
 if not private_channel_id.startswith("-100"):
     private_channel_id = f"-100{private_channel_id.lstrip('-')}"
 private_channel_id = int(private_channel_id)
