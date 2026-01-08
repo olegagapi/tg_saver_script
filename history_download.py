@@ -21,6 +21,9 @@ parser.add_argument("channel_id", nargs="?", help="Channel ID to download from")
 parser.add_argument(
     "-m", type=int, default=None, help="Start from latest and stop at this message ID"
 )
+parser.add_argument(
+    "--over", action="store_true", help="Overwrite files in existing folder"
+)
 args = parser.parse_args()
 
 if args.channel_id:
@@ -54,6 +57,13 @@ async def main():
     os.makedirs(base_folder, exist_ok=True)
 
     channel_folder = os.path.join(base_folder, f"channel_{private_channel_id}")
+
+    # Check if folder exists and --over flag is not set
+    if os.path.exists(channel_folder) and not args.over:
+        print(
+            f"Error: Folder '{channel_folder}' already exists. Use --over to overwrite files."
+        )
+        return
 
     async for message in client.iter_messages(
         private_channel_id, min_id=min_message_id
