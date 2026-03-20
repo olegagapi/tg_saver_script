@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import os
 import re
 
@@ -8,6 +9,7 @@ except ImportError:
     load_dotenv = None
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
 
 if load_dotenv:
@@ -28,6 +30,10 @@ parser.add_argument(
 parser.add_argument(
     "--new", action="store_true",
     help="Download only new messages since latest downloaded"
+)
+parser.add_argument(
+    "-j", "--jobs", type=int, default=3,
+    help="Number of concurrent downloads (default: 3)"
 )
 args = parser.parse_args()
 
@@ -64,10 +70,14 @@ if args.new:
     else:
         print("Warning: no existing downloads found, downloading everything")
 
-client = TelegramClient("session_name", api_id, api_hash, timeout=60)
+client = TelegramClient(
+    "session_name", api_id, api_hash,
+    timeout=120,
+    flood_sleep_threshold=120,
+)
 
 
-async def media_type(message):
+def media_type(message):
     if isinstance(message.media, MessageMediaPhoto):
         return "jpg"
     elif isinstance(message.media, MessageMediaDocument):
@@ -79,60 +89,107 @@ async def media_type(message):
         return ""
 
 
+def save_text(channel_folder, message):
+    if not message.text:
+        return
+    text_file_path = os.path.join(channel_folder, f"{message.id}_message.txt")
+    with open(text_file_path, "w", encoding="utf-8") as text_file:
+        text_file.write(message.text)
+
+
+async def save_media(client, message, channel_folder):
+    if not message.media:
+        return
+    file_resolution = media_type(message)
+    if file_resolution != "":
+        file_name = os.path.join(channel_folder, f"{message.id}_media.{file_resolution}")
+        await client.download_media(message, file_name)
+    else:
+        await client.download_media(message, channel_folder)
+
+
+async def download_message(client, message, channel_folder, semaphore, max_retries=3):
+    async with semaphore:
+        for attempt in range(max_retries):
+            try:
+                save_text(channel_folder, message)
+                await save_media(client, message, channel_folder)
+                return message.id
+            except TimeoutError:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"TimeoutError on message {message.id}, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+            except FloodWaitError as e:
+                print(f"FloodWaitError on message {message.id}, sleeping {e.seconds}s...")
+                await asyncio.sleep(e.seconds)
+            except ConnectionError:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"ConnectionError on message {message.id}, retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+        print(f"Failed to download message {message.id} after {max_retries} retries")
+        return None
+
+
 async def main():
     base_folder = "downloads"
-
-    # Ensure base folder exists
     os.makedirs(base_folder, exist_ok=True)
 
     channel_folder = os.path.join(base_folder, f"channel_{private_channel_id}")
 
-    # Check if folder exists and --over flag is not set
     if os.path.exists(channel_folder) and not args.over and not args.new:
         print(
             f"Error: Folder '{channel_folder}' already exists. Use --over to overwrite files."
         )
         return
 
+    os.makedirs(channel_folder, exist_ok=True)
+
     iter_kwargs = {}
     if min_message_id is not None:
         iter_kwargs["min_id"] = min_message_id
 
+    jobs = args.jobs
+    semaphore = asyncio.Semaphore(jobs)
+    batch_size = jobs * 5
+
+    total = 0
+    succeeded = 0
+    failed_ids = []
+
+    batch = []
     async for message in client.iter_messages(private_channel_id, **iter_kwargs):
         if not message:
             continue
-
-        try:
-            os.makedirs(channel_folder, exist_ok=True)
-            # Create a folder for each message using its ID
-            # message_folder = os.path.join(channel_folder, f'message_{message.id}')
-            # Or dump all messages in the same folder
-            message_folder = channel_folder
-
-            # Save message text if available
-            if message.text:
-                text_file_path = os.path.join(
-                    channel_folder, f"{message.id}_message.txt"
-                )
-                with open(text_file_path, "w", encoding="utf-8") as text_file:
-                    text_file.write(message.text)
-                # print(f"Saved text: {text_file_path}")
-
-            # Save media if available
-            if message.media:
-                file_resolution = await media_type(message)
-                if file_resolution != "":
-                    file_name = os.path.join(
-                        message_folder, f"{message.id}_media.{file_resolution}"
-                    )
-                    media_file_path = await client.download_media(message, file_name)
+        batch.append(message)
+        if len(batch) >= batch_size:
+            results = await asyncio.gather(
+                *(download_message(client, msg, channel_folder, semaphore) for msg in batch)
+            )
+            for msg, result in zip(batch, results):
+                total += 1
+                if result is not None:
+                    succeeded += 1
                 else:
-                    media_file_path = await client.download_media(
-                        message, message_folder
-                    )
-                # print(f"Saved media: {media_file_path}")
-        except TimeoutError:
-            print(f"TimeoutError on message {message.id}")
+                    failed_ids.append(msg.id)
+            print(f"Progress: {total} messages processed")
+            batch = []
+
+    if batch:
+        results = await asyncio.gather(
+            *(download_message(client, msg, channel_folder, semaphore) for msg in batch)
+        )
+        for msg, result in zip(batch, results):
+            total += 1
+            if result is not None:
+                succeeded += 1
+            else:
+                failed_ids.append(msg.id)
+
+    print(f"\nDone: {succeeded}/{total} messages downloaded successfully")
+    if failed_ids:
+        print(f"Failed message IDs: {failed_ids}")
 
 
 with client:
