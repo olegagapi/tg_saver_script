@@ -35,6 +35,12 @@ parser.add_argument(
     "-j", "--jobs", type=int, default=3,
     help="Number of concurrent downloads (default: 3)"
 )
+parser.add_argument(
+    "--skip-vid", action="store_true", help="Skip downloading video files"
+)
+parser.add_argument(
+    "--skip-pic", action="store_true", help="Skip downloading photo files"
+)
 args = parser.parse_args()
 
 if args.channel_id:
@@ -100,6 +106,11 @@ def save_text(channel_folder, message):
 async def save_media(client, message, channel_folder):
     if not message.media:
         return
+    if args.skip_pic and isinstance(message.media, MessageMediaPhoto):
+        return
+    if args.skip_vid and isinstance(message.media, MessageMediaDocument):
+        if message.media.document.mime_type.startswith("video/"):
+            return
     file_resolution = media_type(message)
     if file_resolution != "":
         file_name = os.path.join(channel_folder, f"{message.id}_media.{file_resolution}")
