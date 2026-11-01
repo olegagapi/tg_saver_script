@@ -5,6 +5,8 @@
   python history_download.py <target> --new                  # only messages newer than the last downloaded
   python history_download.py <target> -m 1234                # stop at message id 1234
   python history_download.py https://t.me/c/1234567890/42    # one post (the whole album if it is grouped)
+  python history_download.py <link> --tag regina             # same, into downloads/<peer>-regina/
+  python history_download.py --update                        # --new for every history folder in downloads/
 
 <target> is one of:
   me                 your Saved Messages            -> downloads/saved_messages/
@@ -18,6 +20,10 @@
 Channel posts are saved as bare text; chats get a "date  sender:" header per message.
 Every folder gets 00-info.txt (name, username, id, description, ...) and the profile
 picture as 00-<username>.jpg, written before any message is fetched.
+
+Single posts are saved to downloads/<peer>-<tag>/ (default tag: posts) so they stay apart
+from full histories. --update refreshes only the plain history folders and skips any
+folder with a -tag suffix.
 """
 import argparse
 import asyncio
@@ -74,6 +80,15 @@ parser.add_argument(
     help="list the N most recent chats (default 10) with their targets, then exit",
 )
 parser.add_argument(
+    "--update", action="store_true",
+    help="download new messages for every history folder in downloads/ "
+         "(folders with a -tag suffix are skipped), then exit",
+)
+parser.add_argument(
+    "--tag", default="posts", metavar="NAME",
+    help="folder suffix for single-post downloads: downloads/<peer>-NAME/ (default: posts)",
+)
+parser.add_argument(
     "-m", type=int, default=None, help="Start from latest and stop at this message ID"
 )
 parser.add_argument(
@@ -95,9 +110,13 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-if args.target is None and args.dialogs is None:
+if args.target is None and args.dialogs is None and not args.update:
     parser.print_help()
     sys.exit(2)
+if args.update and (args.target or args.new or args.over or args.m is not None):
+    parser.error("--update takes no target and no -m/--new/--over")
+if not re.fullmatch(r"[A-Za-z0-9_]+", args.tag):
+    parser.error("--tag may only contain letters, digits and _")
 if args.new and args.m is not None:
     parser.error("--new and -m are mutually exclusive")
 if args.jobs < 1:
@@ -180,6 +199,18 @@ def describe(entity):
         target = f"@{username}" if username else f"channel:{internal}"
         return kind, f"channel_{peer_id}", target, username or f"channel_{internal}"
     sys.exit(f"Unsupported peer type: {type(entity).__name__}")
+
+
+HISTORY_FOLDER = re.compile(r"^(?:saved_messages|user_(\d+)|chat_(-\d+)|channel_(-100\d+))$")
+
+
+def peer_from_folder(name):
+    """Inverse of describe(): the peer a plain history folder belongs to, else None."""
+    m = HISTORY_FOLDER.match(name)
+    if not m:
+        return None
+    user_id, chat_id, channel_id = m.groups()
+    return int(user_id or chat_id or channel_id) if any(m.groups()) else "me"
 
 
 def get_latest_message_id(channel_folder):
@@ -317,9 +348,8 @@ async def download_post(client, entity, msg_id, channel_folder, with_header):
         print(f"Failed message IDs: {failed}")
 
 
-async def download_history(client, entity, channel_folder, with_header):
-    min_id = args.m
-    if args.new:
+async def download_history(client, entity, channel_folder, with_header, min_id, resume):
+    if resume:
         latest_id = get_latest_message_id(channel_folder)
         if latest_id is not None:
             min_id = latest_id
@@ -405,6 +435,36 @@ async def write_info(client, entity, folder, kind, target, internal_name):
           + (f", picture to {os.path.basename(saved)}" if saved else ", no profile picture"))
 
 
+async def update_all(client):
+    if not os.path.isdir(BASE_FOLDER):
+        sys.exit(f"Nothing downloaded yet: no {BASE_FOLDER}/ folder.")
+    updated, skipped, failed = 0, [], []
+    for name in sorted(os.listdir(BASE_FOLDER)):
+        folder = os.path.join(BASE_FOLDER, name)
+        if not os.path.isdir(folder):
+            continue
+        peer = peer_from_folder(name)
+        if peer is None:
+            skipped.append(name)
+            continue
+        print(f"\n== {name}")
+        try:
+            entity = await client.get_entity(peer)
+            kind, _, target, internal_name = describe(entity)
+            print(f"Target: {utils.get_display_name(entity) or peer} ({target})")
+            await write_info(client, entity, folder, kind, target, internal_name)
+            await download_history(client, entity, folder, kind != "channel", None, True)
+            updated += 1
+        except (ValueError, RPCError) as e:
+            print(f"{name}: cannot update: {type(e).__name__}: {e}")
+            failed.append(name)
+    print(f"\nUpdated {updated} folder(s).")
+    if skipped:
+        print(f"Skipped (not a history folder): {', '.join(skipped)}")
+    if failed:
+        print(f"Failed: {', '.join(failed)}")
+
+
 async def list_dialogs(client, limit):
     rows = []
     async for dialog in client.iter_dialogs(limit=limit, archived=False):
@@ -418,10 +478,12 @@ async def list_dialogs(client, limit):
 async def main():
     aliases = load_aliases()
     peer = msg_id = None
-    if args.dialogs is None:
+    if args.dialogs is None and not args.update:
         peer, msg_id = parse_target(args.target, aliases)
         if msg_id is not None and (args.new or args.m is not None):
             parser.error("--new and -m do not apply to a single post link")
+        if msg_id is None and args.tag != parser.get_default("tag"):
+            parser.error("--tag only applies to a single post link")
 
     client = TelegramClient(
         SESSION, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"],
@@ -433,12 +495,17 @@ async def main():
         if args.dialogs is not None:
             await list_dialogs(client, args.dialogs)
             return
+        if args.update:
+            await update_all(client)
+            return
         try:
             entity = await client.get_entity(peer)
         except (ValueError, RPCError) as e:
             sys.exit(f"Cannot access {peer!r}: {e}")
         kind, folder_name, target, internal_name = describe(entity)
         print(f"Target: {utils.get_display_name(entity) or peer} ({kind} {utils.get_peer_id(entity)})")
+        if msg_id is not None:
+            folder_name = f"{folder_name}-{args.tag}"
         channel_folder = os.path.join(BASE_FOLDER, folder_name)
         with_header = kind != "channel"
 
@@ -452,7 +519,7 @@ async def main():
         if msg_id is not None:
             await download_post(client, entity, msg_id, channel_folder, with_header)
         else:
-            await download_history(client, entity, channel_folder, with_header)
+            await download_history(client, entity, channel_folder, with_header, args.m, args.new)
 
 
 if __name__ == "__main__":
