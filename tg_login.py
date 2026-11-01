@@ -1,11 +1,13 @@
 """Telegram login for history_download.py.
 
+  python tg_login.py status              # show login state
   python tg_login.py qr                  # scan QR from the app (recommended)
   python tg_login.py send +380XXXXXXXXX  # request a login code
   python tg_login.py code 12345          # finish sign-in with the code
 
 If two-step verification is enabled you are prompted for the password
-(input is hidden).
+(input is hidden). An attempt left unfinished by a previous run is
+discarded automatically and the login starts over.
 
 QR login: open Telegram on your phone -> Settings -> Devices -> Link Desktop Device,
 then scan the QR printed in the terminal.
@@ -25,12 +27,13 @@ try:
 except ImportError:
     pass
 
-from telethon import TelegramClient
+from telethon import TelegramClient, functions
 from telethon.errors import (
     FloodWaitError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
+    RPCError,
     SessionPasswordNeededError,
 )
 
@@ -40,11 +43,25 @@ STATE = ".login_state.json"
 if not os.environ.get("TG_API_ID") or not os.environ.get("TG_API_HASH"):
     sys.exit("TG_API_ID and TG_API_HASH must be set (in .env or the environment).")
 
-client = TelegramClient(SESSION, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+
+def new_client():
+    return TelegramClient(SESSION, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"])
+
+
+client = new_client()
 
 
 def done(me):
     print(f"Logged in as {me.first_name} (id {me.id}). Session saved.")
+
+
+async def reset_session():
+    """Discard the current session file and reconnect with a fresh one."""
+    global client
+    await client.disconnect()
+    client.session.delete()
+    client = new_client()
+    await client.connect()
 
 
 async def ask_2fa(attempts=3):
@@ -58,6 +75,35 @@ async def ask_2fa(attempts=3):
         except PasswordHashInvalidError:
             print("Wrong password, try again.")
     sys.exit("Too many failed password attempts.")
+
+
+async def status():
+    try:
+        await client(functions.updates.GetStateRequest())
+    except SessionPasswordNeededError:
+        print("Not logged in: a previous attempt is waiting for the 2FA password.")
+        print("Run `qr` or `code` to start over.")
+        return
+    except RPCError:
+        print("Not logged in.")
+        if os.path.exists(STATE):
+            with open(STATE) as f:
+                phone = json.load(f)["phone"]
+            print(f"Pending login code for {phone[:4]}***{phone[-2:]}. Run: python tg_login.py code <code>")
+        else:
+            print("Run: python tg_login.py qr")
+        return
+
+    me = await client.get_me()
+    handle = f" @{me.username}" if me.username else ""
+    print(f"Logged in as {me.first_name}{handle} (id {me.id}, phone +{me.phone})")
+    auths = await client(functions.account.GetAuthorizationsRequest())
+    this = next((a for a in auths.authorizations if a.current), None)
+    if this:
+        print(f"This session: {this.app_name} {this.app_version} on {this.device_model}, "
+              f"created {this.date_created:%Y-%m-%d}")
+    print(f"Active sessions on the account: {len(auths.authorizations)}")
+    print(f"Session file: {SESSION}.session")
 
 
 async def qr(attempts=6):
@@ -120,23 +166,30 @@ async def code(value):
     done(me)
 
 
+COMMANDS = {"status": lambda arg: status(), "qr": lambda arg: qr(),
+            "send": send, "code": code}
+
+
 async def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else None
     arg = sys.argv[2] if len(sys.argv) > 2 else None
-    if cmd == "qr":
-        action = qr()
-    elif cmd == "send" and arg:
-        action = send(arg)
-    elif cmd == "code" and arg:
-        action = code(arg)
-    else:
+    if cmd not in COMMANDS or (cmd in ("send", "code") and not arg):
         print(__doc__)
         return
     await client.connect()
     try:
-        await action
-    except SessionPasswordNeededError:
-        sys.exit(f"A previous login was left unfinished. Delete {SESSION}.session and run again.")
+        for attempt in range(2):
+            try:
+                await COMMANDS[cmd](arg)
+                break
+            except SessionPasswordNeededError:
+                # Only reaches here when a previous run was aborted between the
+                # QR scan / code and the 2FA password. The commands handle their
+                # own 2FA prompt, so this state is stale: discard it and retry.
+                if attempt:
+                    raise
+                print("Discarding an unfinished login attempt and starting over.")
+                await reset_session()
     except FloodWaitError as e:
         sys.exit(f"Telegram rate limit: wait {e.seconds}s and try again.")
     finally:
