@@ -1,7 +1,10 @@
-# Channel aliases for history_download.py. Copy to aliases.toml and edit.
-# One line per alias: name = channel id (with or without the -100 prefix)
-# or a public "@username". Alias names may use letters, digits, - and _.
+# Aliases for history_download.py. Copy to aliases.toml and edit.
+# One line per alias: name = any target the script accepts. Alias names may
+# use letters, digits, - and _. Quote everything except bare channel ids.
 
-news = -1001234567890
-memes = 1234567890
-durov = "@durov"
+news = -1001234567890        # channel id as Telegram clients show it
+memes = 1234567890           # same, without the -100 prefix
+durov = "@durov"             # public username (channel, group or person)
+saved = "me"                 # your Saved Messages
+oleg = "user:123456789"      # a person by id (see --dialogs)
+family = "chat:123456789"    # a basic group by id

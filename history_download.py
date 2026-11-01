@@ -1,12 +1,21 @@
-"""Download Telegram channel history or a single post.
+"""Download Telegram history: channels, groups, private chats, Saved Messages, or one post.
 
-  python history_download.py <channel>                       # whole channel
-  python history_download.py <channel> --new                 # only messages newer than the last downloaded
-  python history_download.py <channel> -m 1234               # stop at message id 1234
+  python history_download.py --dialogs [N]                   # list recent chats with their targets (default 10)
+  python history_download.py <target>                        # whole history
+  python history_download.py <target> --new                  # only messages newer than the last downloaded
+  python history_download.py <target> -m 1234                # stop at message id 1234
   python history_download.py https://t.me/c/1234567890/42    # one post (the whole album if it is grouped)
 
-<channel> is a channel id (-100... or bare digits), an alias from aliases.toml,
-or a public @username. Files go to downloads/channel_<id>/.
+<target> is one of:
+  me                 your Saved Messages            -> downloads/saved_messages/
+  @username          public channel, group or user
+  user:123           a person by id                 -> downloads/user_123/
+  chat:123           a basic group by id            -> downloads/chat_-123/
+  channel:123        a channel/supergroup by id     -> downloads/channel_-100123/
+  -1001234567890     channel id as shown by Telegram clients (bare digits mean the same)
+  an alias from aliases.toml, or a t.me link.
+
+Channel posts are saved as bare text; chats get a "date  sender:" header per message.
 """
 import argparse
 import asyncio
@@ -24,11 +33,14 @@ except ImportError:
 from telethon import TelegramClient, utils
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import (
+    Channel,
+    Chat,
     DocumentAttributeFilename,
     MessageExtendedMedia,
     MessageMediaDocument,
     MessageMediaPaidMedia,
     MessageMediaPhoto,
+    User,
 )
 
 if not os.environ.get("TG_API_ID") or not os.environ.get("TG_API_HASH"):
@@ -42,14 +54,19 @@ MSG_LINK = re.compile(
     r"^(?:https?://)?t\.me/(?:c/(\d+)|([A-Za-z]\w{3,}))/(?:\d+/)?(\d+)/?(?:\?.*)?$"
 )
 CHANNEL_LINK = re.compile(r"^(?:https?://)?t\.me/([A-Za-z]\w{3,})/?$")
+PREFIXED_ID = re.compile(r"^(user|chat|channel):(\d+)$")
 
 parser = argparse.ArgumentParser(
-    description="Download Telegram channel history or a single post",
+    description="Download Telegram history or a single post",
     epilog=f"Aliases are read from {ALIASES} (see aliases.example.toml).",
 )
 parser.add_argument(
     "target", nargs="?",
-    help="channel id, alias, @username, or a t.me message link for a single post",
+    help="me, @username, user:ID, chat:ID, channel:ID, alias, or a t.me link",
+)
+parser.add_argument(
+    "--dialogs", nargs="?", const=10, type=int, metavar="N",
+    help="list the N most recent chats (default 10) with their targets, then exit",
 )
 parser.add_argument(
     "-m", type=int, default=None, help="Start from latest and stop at this message ID"
@@ -77,6 +94,8 @@ if args.new and args.m is not None:
     parser.error("--new and -m are mutually exclusive")
 if args.jobs < 1:
     parser.error("--jobs must be at least 1")
+if args.dialogs is not None and args.dialogs < 1:
+    parser.error("--dialogs needs a positive number")
 
 
 def load_aliases():
@@ -89,16 +108,26 @@ def load_aliases():
         sys.exit(f"{ALIASES}: {e}")
     bad = [k for k, v in data.items() if not isinstance(v, (int, str))]
     if bad:
-        sys.exit(f"{ALIASES}: values must be a channel id or @username, check: {', '.join(bad)}")
+        sys.exit(f"{ALIASES}: values must be an id, @username or target string, check: {', '.join(bad)}")
     return data
 
 
 def parse_target(value, aliases):
-    """Return (peer, message_id). peer is an int channel id or a username;
-    message_id is None unless value is a link to a single post."""
+    """Return (peer, message_id). peer is anything client.get_entity accepts:
+    'me', a username, a phone, or a Telethon marked id (user 123, chat -123,
+    channel -100123). message_id is None unless value links to a single post."""
     value = str(value).strip()
     if value in aliases:
         return parse_target(aliases[value], {})  # no alias chains
+
+    if value == "me":
+        return "me", None
+
+    m = PREFIXED_ID.match(value)
+    if m:
+        kind, digits = m.groups()
+        mark = {"user": "", "chat": "-", "channel": "-100"}[kind]
+        return int(f"{mark}{digits}"), None
 
     m = MSG_LINK.match(value)
     if m:
@@ -111,6 +140,8 @@ def parse_target(value, aliases):
         return m.group(1), None
     if value.startswith("@"):
         return value[1:], None
+    if value.startswith("+") and value[1:].isdigit():
+        return value, None  # phone number of a contact
 
     digits = value.lstrip("-")
     if digits.isdigit():
@@ -119,7 +150,26 @@ def parse_target(value, aliases):
         return int(f"-{digits}"), None
 
     hint = f"Known aliases: {', '.join(sorted(aliases))}" if aliases else f"No {ALIASES} found."
-    sys.exit(f"'{value}' is not a channel id, alias, @username or t.me link. {hint}")
+    sys.exit(f"'{value}' is not a valid target (me, @username, user:ID, chat:ID, "
+             f"channel:ID, channel id, alias or t.me link). {hint}")
+
+
+def describe(entity):
+    """Return (kind, folder_name, target) for a resolved peer."""
+    peer_id = utils.get_peer_id(entity)
+    username = getattr(entity, "username", None)
+    if isinstance(entity, User):
+        if entity.is_self:
+            return "me", "saved_messages", "me"
+        kind = "bot" if entity.bot else "user"
+        return kind, f"user_{peer_id}", f"@{username}" if username else f"user:{peer_id}"
+    if isinstance(entity, Chat):
+        return "group", f"chat_{peer_id}", f"chat:{abs(peer_id)}"
+    if isinstance(entity, Channel):
+        kind = "group" if entity.megagroup else "channel"
+        target = f"@{username}" if username else f"channel:{str(peer_id)[4:]}"
+        return kind, f"channel_{peer_id}", target
+    sys.exit(f"Unsupported peer type: {type(entity).__name__}")
 
 
 def get_latest_message_id(channel_folder):
@@ -166,12 +216,35 @@ def media_path(message, media, channel_folder, index=None):
     return os.path.join(channel_folder, f"{message.id}{suffix}_{name}")
 
 
-def save_text(channel_folder, message):
-    if not message.text:
+def message_header(message):
+    """'date  sender:' line plus a 'forwarded from' line when applicable."""
+    sender = message.sender
+    if sender is None:
+        name = message.post_author or "?"
+    elif getattr(sender, "deleted", False):
+        name = "Deleted Account"
+    else:
+        name = utils.get_display_name(sender) or f"user {sender.id}"
+    lines = [f"{message.date.astimezone():%Y-%m-%d %H:%M}  {name}:"]
+    fwd = message.forward
+    if fwd:
+        origin = fwd.chat or fwd.sender
+        name = utils.get_display_name(origin) if origin else fwd.from_name
+        lines.append(f"forwarded from {name or 'hidden sender'}")
+    return "\n".join(lines)
+
+
+def save_text(channel_folder, message, with_header):
+    if not with_header and not message.text:
         return
+    if with_header and not message.text and not message.media:
+        return  # service messages, nothing to record
+    parts = [message_header(message)] if with_header else []
+    if message.text:
+        parts.append(message.text)
     with open(os.path.join(channel_folder, f"{message.id}_message.txt"), "w",
               encoding="utf-8") as text_file:
-        text_file.write(message.text)
+        text_file.write("\n\n".join(parts))
 
 
 async def save_media(client, message, channel_folder):
@@ -185,11 +258,12 @@ async def save_media(client, message, channel_folder):
         await client.download_media(media, media_path(message, media, channel_folder, index))
 
 
-async def download_message(client, message, channel_folder, semaphore, max_retries=3):
+async def download_message(client, message, channel_folder, with_header, semaphore,
+                           max_retries=3):
     async with semaphore:
         for attempt in range(max_retries):
             try:
-                save_text(channel_folder, message)
+                save_text(channel_folder, message, with_header)
                 await save_media(client, message, channel_folder)
                 return message.id
             except FloodWaitError as e:
@@ -207,17 +281,18 @@ async def download_message(client, message, channel_folder, semaphore, max_retri
         return None
 
 
-async def download_all(client, messages, channel_folder):
+async def download_all(client, messages, channel_folder, with_header):
     """Download a list of messages concurrently. Returns (succeeded, failed_ids)."""
     semaphore = asyncio.Semaphore(args.jobs)
     results = await asyncio.gather(
-        *(download_message(client, msg, channel_folder, semaphore) for msg in messages)
+        *(download_message(client, msg, channel_folder, with_header, semaphore)
+          for msg in messages)
     )
     failed = [msg.id for msg, ok in zip(messages, results) if ok is None]
     return len(messages) - len(failed), failed
 
 
-async def download_post(client, entity, msg_id, channel_folder):
+async def download_post(client, entity, msg_id, channel_folder, with_header):
     message = await client.get_messages(entity, ids=msg_id)
     if message is None:
         sys.exit(f"Message {msg_id} not found in this channel.")
@@ -227,13 +302,13 @@ async def download_post(client, entity, msg_id, channel_folder):
         messages = [m for m in around if m and m.grouped_id == message.grouped_id]
         print(f"Album with {len(messages)} items")
     os.makedirs(channel_folder, exist_ok=True)
-    succeeded, failed = await download_all(client, messages, channel_folder)
+    succeeded, failed = await download_all(client, messages, channel_folder, with_header)
     print(f"Done: {succeeded}/{len(messages)} messages saved to {channel_folder}")
     if failed:
         print(f"Failed message IDs: {failed}")
 
 
-async def download_history(client, entity, channel_folder):
+async def download_history(client, entity, channel_folder, with_header):
     min_id = args.m
     if args.new:
         latest_id = get_latest_message_id(channel_folder)
@@ -254,7 +329,7 @@ async def download_history(client, entity, channel_folder):
 
     async def flush(batch):
         nonlocal total, succeeded
-        ok, failed = await download_all(client, batch, channel_folder)
+        ok, failed = await download_all(client, batch, channel_folder, with_header)
         total += len(batch)
         succeeded += ok
         failed_ids.extend(failed)
@@ -274,12 +349,24 @@ async def download_history(client, entity, channel_folder):
         print(f"Failed message IDs: {failed_ids}")
 
 
+async def list_dialogs(client, limit):
+    rows = []
+    async for dialog in client.iter_dialogs(limit=limit, archived=False):
+        kind, _, target = describe(dialog.entity)
+        rows.append((kind, dialog.name or "(no name)", target))
+    width = max((len(name) for _, name, _ in rows), default=0)
+    for kind, name, target in rows:
+        print(f"{kind:<8} {name:<{width}}  {target}")
+
+
 async def main():
     aliases = load_aliases()
-    target = args.target or input("Enter channel id, alias or link: ")
-    peer, msg_id = parse_target(target, aliases)
-    if msg_id is not None and (args.new or args.m is not None):
-        parser.error("--new and -m do not apply to a single post link")
+    peer = msg_id = None
+    if args.dialogs is None:
+        target = args.target or input("Enter target (me, @username, id, alias or link): ")
+        peer, msg_id = parse_target(target, aliases)
+        if msg_id is not None and (args.new or args.m is not None):
+            parser.error("--new and -m do not apply to a single post link")
 
     client = TelegramClient(
         SESSION, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"],
@@ -288,18 +375,22 @@ async def main():
     async with client:
         if not await client.is_user_authorized():
             sys.exit("Not logged in. Run: python tg_login.py qr")
+        if args.dialogs is not None:
+            await list_dialogs(client, args.dialogs)
+            return
         try:
             entity = await client.get_entity(peer)
         except (ValueError, RPCError) as e:
-            sys.exit(f"Cannot access channel {peer!r}: {e}")
-        channel_id = utils.get_peer_id(entity)
-        print(f"Channel: {getattr(entity, 'title', peer)} ({channel_id})")
-        channel_folder = os.path.join(BASE_FOLDER, f"channel_{channel_id}")
+            sys.exit(f"Cannot access {peer!r}: {e}")
+        kind, folder_name, _ = describe(entity)
+        print(f"Target: {utils.get_display_name(entity) or peer} ({kind} {utils.get_peer_id(entity)})")
+        channel_folder = os.path.join(BASE_FOLDER, folder_name)
+        with_header = kind != "channel"
 
         if msg_id is not None:
-            await download_post(client, entity, msg_id, channel_folder)
+            await download_post(client, entity, msg_id, channel_folder, with_header)
         else:
-            await download_history(client, entity, channel_folder)
+            await download_history(client, entity, channel_folder, with_header)
 
 
 if __name__ == "__main__":
