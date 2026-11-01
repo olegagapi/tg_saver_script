@@ -8,6 +8,11 @@ downloads/
 
 # session info
 *.session
+*.session-journal
+.login_state.json
+
+# macOS
+.DS_Store
 
 # C extensions
 *.so

@@ -203,5 +203,9 @@ async def main():
         print(f"Failed message IDs: {failed_ids}")
 
 
-with client:
-    client.loop.run_until_complete(main())
+async def run():
+    async with client:
+        await main()
+
+
+asyncio.run(run())
