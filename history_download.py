@@ -23,6 +23,13 @@ except ImportError:
 
 from telethon import TelegramClient, utils
 from telethon.errors import FloodWaitError, RPCError
+from telethon.tl.types import (
+    DocumentAttributeFilename,
+    MessageExtendedMedia,
+    MessageMediaDocument,
+    MessageMediaPaidMedia,
+    MessageMediaPhoto,
+)
 
 if not os.environ.get("TG_API_ID") or not os.environ.get("TG_API_HASH"):
     sys.exit("TG_API_ID and TG_API_HASH must be set (in .env or the environment).")
@@ -123,15 +130,40 @@ def get_latest_message_id(channel_folder):
     return max(ids) if ids else None
 
 
-def media_path(message, channel_folder):
-    """Target path for the message's media, or None if there is nothing to download."""
-    f = message.file
-    if f is None:  # polls, geo, link previews, ...
-        return None
-    if message.photo or (f.mime_type or "").startswith("video/"):
-        return os.path.join(channel_folder, f"{message.id}_media{f.ext or ''}")
-    name = os.path.basename(f.name) if f.name else f"media{f.ext or ''}"
-    return os.path.join(channel_folder, f"{message.id}_{name}")
+def media_items(message):
+    """Downloadable media objects in a message.
+
+    Spoiler-covered media ("click to reveal") is ordinary media with a flag, so it
+    needs nothing special. Paid media is a wrapper: once purchased, the real
+    photos/videos sit inside it; before purchase there are only blurred previews.
+    """
+    media = message.media
+    if isinstance(media, MessageMediaPaidMedia):
+        items = [x.media for x in media.extended_media if isinstance(x, MessageExtendedMedia)]
+        if not items:
+            print(f"Message {message.id}: paid media not purchased "
+                  f"({media.stars_amount} stars), only the text is saved")
+        return items
+    if isinstance(media, (MessageMediaPhoto, MessageMediaDocument)) and message.file:
+        return [media]
+    return []  # polls, geo, link previews, ...
+
+
+def is_video(media):
+    doc = getattr(media, "document", None)
+    return bool(doc) and (doc.mime_type or "").startswith("video/")
+
+
+def media_path(message, media, channel_folder, index=None):
+    """Target path for one media object of the message."""
+    suffix = f"_{index}" if index is not None else ""
+    ext = utils.get_extension(media)
+    doc = getattr(media, "document", None)
+    if isinstance(media, MessageMediaPhoto) or is_video(media) or not doc:
+        return os.path.join(channel_folder, f"{message.id}_media{suffix}{ext}")
+    name = next((os.path.basename(a.file_name) for a in doc.attributes
+                 if isinstance(a, DocumentAttributeFilename) and a.file_name), f"media{ext}")
+    return os.path.join(channel_folder, f"{message.id}{suffix}_{name}")
 
 
 def save_text(channel_folder, message):
@@ -143,14 +175,14 @@ def save_text(channel_folder, message):
 
 
 async def save_media(client, message, channel_folder):
-    path = media_path(message, channel_folder)
-    if path is None:
-        return
-    if args.skip_pic and message.photo:
-        return
-    if args.skip_vid and (message.file.mime_type or "").startswith("video/"):
-        return
-    await client.download_media(message, path)
+    items = media_items(message)
+    for i, media in enumerate(items, 1):
+        if args.skip_pic and isinstance(media, MessageMediaPhoto):
+            continue
+        if args.skip_vid and is_video(media):
+            continue
+        index = i if len(items) > 1 else None
+        await client.download_media(media, media_path(message, media, channel_folder, index))
 
 
 async def download_message(client, message, channel_folder, semaphore, max_retries=3):
