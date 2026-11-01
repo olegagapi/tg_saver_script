@@ -1,0 +1,7 @@
+# Channel aliases for history_download.py. Copy to aliases.toml and edit.
+# One line per alias: name = channel id (with or without the -100 prefix)
+# or a public "@username". Alias names may use letters, digits, - and _.
+
+news = -1001234567890
+memes = 1234567890
+durov = "@durov"

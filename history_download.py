@@ -1,26 +1,49 @@
+"""Download Telegram channel history or a single post.
+
+  python history_download.py <channel>                       # whole channel
+  python history_download.py <channel> --new                 # only messages newer than the last downloaded
+  python history_download.py <channel> -m 1234               # stop at message id 1234
+  python history_download.py https://t.me/c/1234567890/42    # one post (the whole album if it is grouped)
+
+<channel> is a channel id (-100... or bare digits), an alias from aliases.toml,
+or a public @username. Files go to downloads/channel_<id>/.
+"""
 import argparse
 import asyncio
 import os
 import re
+import sys
+import tomllib
 
 try:
     from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
-from telethon import TelegramClient
-from telethon.errors import FloodWaitError
-from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
-
-if load_dotenv:
     load_dotenv()
+except ImportError:
+    pass
 
-# Replace with your credentials
-api_id = int(os.environ["TG_API_ID"])
-api_hash = os.environ["TG_API_HASH"]
+from telethon import TelegramClient, utils
+from telethon.errors import FloodWaitError, RPCError
 
-parser = argparse.ArgumentParser(description="Download Telegram channel history")
-parser.add_argument("channel_id", nargs="?", help="Channel ID to download from")
+if not os.environ.get("TG_API_ID") or not os.environ.get("TG_API_HASH"):
+    sys.exit("TG_API_ID and TG_API_HASH must be set (in .env or the environment).")
+
+SESSION = "session_name"
+ALIASES = "aliases.toml"
+BASE_FOLDER = "downloads"
+
+MSG_LINK = re.compile(
+    r"^(?:https?://)?t\.me/(?:c/(\d+)|([A-Za-z]\w{3,}))/(?:\d+/)?(\d+)/?(?:\?.*)?$"
+)
+CHANNEL_LINK = re.compile(r"^(?:https?://)?t\.me/([A-Za-z]\w{3,})/?$")
+
+parser = argparse.ArgumentParser(
+    description="Download Telegram channel history or a single post",
+    epilog=f"Aliases are read from {ALIASES} (see aliases.example.toml).",
+)
+parser.add_argument(
+    "target", nargs="?",
+    help="channel id, alias, @username, or a t.me message link for a single post",
+)
 parser.add_argument(
     "-m", type=int, default=None, help="Start from latest and stop at this message ID"
 )
@@ -43,80 +66,91 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
-if args.channel_id:
-    private_channel_id = args.channel_id.strip()
-else:
-    private_channel_id = input("Enter channel ID: ").strip()
-if not private_channel_id.startswith("-100"):
-    private_channel_id = f"-100{private_channel_id.lstrip('-')}"
-private_channel_id = int(private_channel_id)
 if args.new and args.m is not None:
     parser.error("--new and -m are mutually exclusive")
+if args.jobs < 1:
+    parser.error("--jobs must be at least 1")
+
+
+def load_aliases():
+    try:
+        with open(ALIASES, "rb") as f:
+            data = tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"{ALIASES}: {e}")
+    bad = [k for k, v in data.items() if not isinstance(v, (int, str))]
+    if bad:
+        sys.exit(f"{ALIASES}: values must be a channel id or @username, check: {', '.join(bad)}")
+    return data
+
+
+def parse_target(value, aliases):
+    """Return (peer, message_id). peer is an int channel id or a username;
+    message_id is None unless value is a link to a single post."""
+    value = str(value).strip()
+    if value in aliases:
+        return parse_target(aliases[value], {})  # no alias chains
+
+    m = MSG_LINK.match(value)
+    if m:
+        internal_id, username, msg_id = m.groups()
+        peer = int(f"-100{internal_id}") if internal_id else username
+        return peer, int(msg_id)
+
+    m = CHANNEL_LINK.match(value)
+    if m:
+        return m.group(1), None
+    if value.startswith("@"):
+        return value[1:], None
+
+    digits = value.lstrip("-")
+    if digits.isdigit():
+        if not digits.startswith("100"):
+            digits = f"100{digits}"
+        return int(f"-{digits}"), None
+
+    hint = f"Known aliases: {', '.join(sorted(aliases))}" if aliases else f"No {ALIASES} found."
+    sys.exit(f"'{value}' is not a channel id, alias, @username or t.me link. {hint}")
 
 
 def get_latest_message_id(channel_folder):
-    if not os.path.exists(channel_folder):
+    if not os.path.isdir(channel_folder):
         return None
-    max_id = 0
-    for filename in os.listdir(channel_folder):
-        match = re.match(r"^(\d+)_", filename)
-        if match:
-            max_id = max(max_id, int(match.group(1)))
-    return max_id if max_id > 0 else None
+    ids = [int(m.group(1)) for name in os.listdir(channel_folder)
+           if (m := re.match(r"^(\d+)_", name))]
+    return max(ids) if ids else None
 
 
-min_message_id = args.m
-
-if args.new:
-    channel_folder = os.path.join("downloads", f"channel_{private_channel_id}")
-    latest_id = get_latest_message_id(channel_folder)
-    if latest_id is not None:
-        min_message_id = latest_id
-        print(f"Resuming from message ID {latest_id}")
-    else:
-        print("Warning: no existing downloads found, downloading everything")
-
-client = TelegramClient(
-    "session_name", api_id, api_hash,
-    timeout=120,
-    flood_sleep_threshold=120,
-)
-
-
-def media_type(message):
-    if isinstance(message.media, MessageMediaPhoto):
-        return "jpg"
-    elif isinstance(message.media, MessageMediaDocument):
-        if message.media.document.mime_type.startswith("video/"):
-            return "mp4"
-        else:
-            return ""
-    else:
-        return ""
+def media_path(message, channel_folder):
+    """Target path for the message's media, or None if there is nothing to download."""
+    f = message.file
+    if f is None:  # polls, geo, link previews, ...
+        return None
+    if message.photo or (f.mime_type or "").startswith("video/"):
+        return os.path.join(channel_folder, f"{message.id}_media{f.ext or ''}")
+    name = os.path.basename(f.name) if f.name else f"media{f.ext or ''}"
+    return os.path.join(channel_folder, f"{message.id}_{name}")
 
 
 def save_text(channel_folder, message):
     if not message.text:
         return
-    text_file_path = os.path.join(channel_folder, f"{message.id}_message.txt")
-    with open(text_file_path, "w", encoding="utf-8") as text_file:
+    with open(os.path.join(channel_folder, f"{message.id}_message.txt"), "w",
+              encoding="utf-8") as text_file:
         text_file.write(message.text)
 
 
 async def save_media(client, message, channel_folder):
-    if not message.media:
+    path = media_path(message, channel_folder)
+    if path is None:
         return
-    if args.skip_pic and isinstance(message.media, MessageMediaPhoto):
+    if args.skip_pic and message.photo:
         return
-    if args.skip_vid and isinstance(message.media, MessageMediaDocument):
-        if message.media.document.mime_type.startswith("video/"):
-            return
-    file_resolution = media_type(message)
-    if file_resolution != "":
-        file_name = os.path.join(channel_folder, f"{message.id}_media.{file_resolution}")
-        await client.download_media(message, file_name)
-    else:
-        await client.download_media(message, channel_folder)
+    if args.skip_vid and (message.file.mime_type or "").startswith("video/"):
+        return
+    await client.download_media(message, path)
 
 
 async def download_message(client, message, channel_folder, semaphore, max_retries=3):
@@ -126,86 +160,118 @@ async def download_message(client, message, channel_folder, semaphore, max_retri
                 save_text(channel_folder, message)
                 await save_media(client, message, channel_folder)
                 return message.id
-            except TimeoutError:
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    print(f"TimeoutError on message {message.id}, retrying in {wait}s...")
-                    await asyncio.sleep(wait)
             except FloodWaitError as e:
                 print(f"FloodWaitError on message {message.id}, sleeping {e.seconds}s...")
                 await asyncio.sleep(e.seconds)
-            except ConnectionError:
+            except (TimeoutError, ConnectionError) as e:
                 if attempt < max_retries - 1:
                     wait = 2 ** attempt
-                    print(f"ConnectionError on message {message.id}, retrying in {wait}s...")
+                    print(f"{type(e).__name__} on message {message.id}, retrying in {wait}s...")
                     await asyncio.sleep(wait)
+            except (RPCError, OSError) as e:
+                print(f"Error on message {message.id}: {type(e).__name__}: {e}")
+                return None
         print(f"Failed to download message {message.id} after {max_retries} retries")
         return None
 
 
-async def main():
-    base_folder = "downloads"
-    os.makedirs(base_folder, exist_ok=True)
+async def download_all(client, messages, channel_folder):
+    """Download a list of messages concurrently. Returns (succeeded, failed_ids)."""
+    semaphore = asyncio.Semaphore(args.jobs)
+    results = await asyncio.gather(
+        *(download_message(client, msg, channel_folder, semaphore) for msg in messages)
+    )
+    failed = [msg.id for msg, ok in zip(messages, results) if ok is None]
+    return len(messages) - len(failed), failed
 
-    channel_folder = os.path.join(base_folder, f"channel_{private_channel_id}")
 
-    if os.path.exists(channel_folder) and not args.over and not args.new:
-        print(
-            f"Error: Folder '{channel_folder}' already exists. Use --over to overwrite files."
-        )
-        return
+async def download_post(client, entity, msg_id, channel_folder):
+    message = await client.get_messages(entity, ids=msg_id)
+    if message is None:
+        sys.exit(f"Message {msg_id} not found in this channel.")
+    messages = [message]
+    if message.grouped_id:  # an album: fetch its siblings (albums hold at most 10 items)
+        around = await client.get_messages(entity, ids=list(range(msg_id - 9, msg_id + 10)))
+        messages = [m for m in around if m and m.grouped_id == message.grouped_id]
+        print(f"Album with {len(messages)} items")
+    os.makedirs(channel_folder, exist_ok=True)
+    succeeded, failed = await download_all(client, messages, channel_folder)
+    print(f"Done: {succeeded}/{len(messages)} messages saved to {channel_folder}")
+    if failed:
+        print(f"Failed message IDs: {failed}")
 
+
+async def download_history(client, entity, channel_folder):
+    min_id = args.m
+    if args.new:
+        latest_id = get_latest_message_id(channel_folder)
+        if latest_id is not None:
+            min_id = latest_id
+            print(f"Resuming from message ID {latest_id}")
+        else:
+            print("Warning: no existing downloads found, downloading everything")
+    elif os.path.exists(channel_folder) and not args.over:
+        sys.exit(f"Error: folder '{channel_folder}' already exists. "
+                 "Use --over to overwrite files or --new to fetch only new messages.")
     os.makedirs(channel_folder, exist_ok=True)
 
-    iter_kwargs = {}
-    if min_message_id is not None:
-        iter_kwargs["min_id"] = min_message_id
-
-    jobs = args.jobs
-    semaphore = asyncio.Semaphore(jobs)
-    batch_size = jobs * 5
-
-    total = 0
-    succeeded = 0
+    iter_kwargs = {"min_id": min_id} if min_id is not None else {}
+    batch_size = args.jobs * 5
+    total = succeeded = 0
     failed_ids = []
 
+    async def flush(batch):
+        nonlocal total, succeeded
+        ok, failed = await download_all(client, batch, channel_folder)
+        total += len(batch)
+        succeeded += ok
+        failed_ids.extend(failed)
+        print(f"Progress: {total} messages processed")
+
     batch = []
-    async for message in client.iter_messages(private_channel_id, **iter_kwargs):
-        if not message:
-            continue
+    async for message in client.iter_messages(entity, **iter_kwargs):
         batch.append(message)
         if len(batch) >= batch_size:
-            results = await asyncio.gather(
-                *(download_message(client, msg, channel_folder, semaphore) for msg in batch)
-            )
-            for msg, result in zip(batch, results):
-                total += 1
-                if result is not None:
-                    succeeded += 1
-                else:
-                    failed_ids.append(msg.id)
-            print(f"Progress: {total} messages processed")
+            await flush(batch)
             batch = []
-
     if batch:
-        results = await asyncio.gather(
-            *(download_message(client, msg, channel_folder, semaphore) for msg in batch)
-        )
-        for msg, result in zip(batch, results):
-            total += 1
-            if result is not None:
-                succeeded += 1
-            else:
-                failed_ids.append(msg.id)
+        await flush(batch)
 
-    print(f"\nDone: {succeeded}/{total} messages downloaded successfully")
+    print(f"\nDone: {succeeded}/{total} messages downloaded to {channel_folder}")
     if failed_ids:
         print(f"Failed message IDs: {failed_ids}")
 
 
-async def run():
+async def main():
+    aliases = load_aliases()
+    target = args.target or input("Enter channel id, alias or link: ")
+    peer, msg_id = parse_target(target, aliases)
+    if msg_id is not None and (args.new or args.m is not None):
+        parser.error("--new and -m do not apply to a single post link")
+
+    client = TelegramClient(
+        SESSION, int(os.environ["TG_API_ID"]), os.environ["TG_API_HASH"],
+        timeout=120, flood_sleep_threshold=120,
+    )
     async with client:
-        await main()
+        if not await client.is_user_authorized():
+            sys.exit("Not logged in. Run: python tg_login.py qr")
+        try:
+            entity = await client.get_entity(peer)
+        except (ValueError, RPCError) as e:
+            sys.exit(f"Cannot access channel {peer!r}: {e}")
+        channel_id = utils.get_peer_id(entity)
+        print(f"Channel: {getattr(entity, 'title', peer)} ({channel_id})")
+        channel_folder = os.path.join(BASE_FOLDER, f"channel_{channel_id}")
+
+        if msg_id is not None:
+            await download_post(client, entity, msg_id, channel_folder)
+        else:
+            await download_history(client, entity, channel_folder)
 
 
-asyncio.run(run())
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit("\nAborted.")
