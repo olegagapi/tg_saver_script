@@ -1,12 +1,12 @@
 """Download Telegram history: channels, groups, private chats, Saved Messages, or one post.
 
-  python history_download.py --dialogs [N]                   # list recent chats with their targets (default 10)
-  python history_download.py <target>                        # whole history
-  python history_download.py <target> --new                  # only messages newer than the last downloaded
-  python history_download.py <target> -m 1234                # stop at message id 1234
-  python history_download.py https://t.me/c/1234567890/42    # one post (the whole album if it is grouped)
-  python history_download.py <link> --tag regina             # same, into downloads/<peer>-regina/
-  python history_download.py --update                        # --new for every history folder in downloads/
+  ./tg --dialogs [N]                   # list recent chats with their targets (default 10)
+  ./tg <target>                        # whole history
+  ./tg <target> --new                  # only messages newer than the last downloaded
+  ./tg <target> -m 1234                # stop at message id 1234
+  ./tg https://t.me/c/1234567890/42    # one post (the whole album if it is grouped)
+  ./tg <link> --tag regina             # same, into downloads/<peer>-regina/
+  ./tg --update                        # --new for every history folder in downloads/
 
 <target> is one of:
   me                 your Saved Messages            -> downloads/saved_messages/
@@ -31,7 +31,10 @@ import os
 import re
 import sys
 import tomllib
+from collections import namedtuple
 from datetime import datetime
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))  # .env, session, downloads/ live here
 
 try:
     from dotenv import load_dotenv
@@ -52,21 +55,19 @@ from telethon.tl.types import (
     User,
 )
 
-if not os.environ.get("TG_API_ID") or not os.environ.get("TG_API_HASH"):
-    sys.exit("TG_API_ID and TG_API_HASH must be set (in .env or the environment).")
-
 SESSION = "session_name"
 ALIASES = "aliases.toml"
 BASE_FOLDER = "downloads"
 INFO_PREFIX = "00-"  # sorts before every message id
 
 MSG_LINK = re.compile(
-    r"^(?:https?://)?t\.me/(?:c/(\d+)|([A-Za-z]\w{3,}))/(?:\d+/)?(\d+)/?(?:\?.*)?$"
+    r"^(?:https?://)?t\.me/(?:s/)?(?:c/(\d+)|([A-Za-z]\w{3,}))/(?:\d+/)?(\d+)/?(?:\?.*)?$"
 )
 CHANNEL_LINK = re.compile(r"^(?:https?://)?t\.me/([A-Za-z]\w{3,})/?$")
 PREFIXED_ID = re.compile(r"^(user|chat|channel):(\d+)$")
 
 parser = argparse.ArgumentParser(
+    prog="tg",
     description=__doc__,
     formatter_class=argparse.RawDescriptionHelpFormatter,
     epilog=f"Aliases are read from {ALIASES} (see aliases.example.toml).",
@@ -123,6 +124,8 @@ if args.jobs < 1:
     parser.error("--jobs must be at least 1")
 if args.dialogs is not None and args.dialogs < 1:
     parser.error("--dialogs needs a positive number")
+if not os.environ.get("TG_API_ID") or not os.environ.get("TG_API_HASH"):
+    sys.exit("TG_API_ID and TG_API_HASH must be set (in .env or the environment).")
 
 
 def load_aliases():
@@ -181,24 +184,32 @@ def parse_target(value, aliases):
              f"channel:ID, channel id, alias or t.me link). {hint}")
 
 
+class Peer(namedtuple("Peer", "kind folder target internal_name")):
+    """What we need to know about a resolved entity: its kind (me/user/bot/group/channel),
+    the history folder name, a copy-pasteable target and a name for the picture file."""
+
+    @property
+    def with_header(self):
+        return self.kind != "channel"  # chats record who said what; channel posts are bare
+
+
 def describe(entity):
-    """Return (kind, folder_name, target, internal_name) for a resolved peer."""
     peer_id = utils.get_peer_id(entity)
     username = getattr(entity, "username", None)
     if isinstance(entity, User):
         if entity.is_self:
-            return "me", "saved_messages", "me", username or "me"
+            return Peer("me", "saved_messages", "me", username or "me")
         kind = "bot" if entity.bot else "user"
         target = f"@{username}" if username else f"user:{peer_id}"
-        return kind, f"user_{peer_id}", target, username or f"user_{peer_id}"
+        return Peer(kind, f"user_{peer_id}", target, username or f"user_{peer_id}")
     if isinstance(entity, Chat):
-        return "group", f"chat_{peer_id}", f"chat:{abs(peer_id)}", f"chat_{abs(peer_id)}"
+        return Peer("group", f"chat_{peer_id}", f"chat:{abs(peer_id)}", f"chat_{abs(peer_id)}")
     if isinstance(entity, Channel):
         kind = "group" if entity.megagroup else "channel"
         internal = str(peer_id)[4:]
         target = f"@{username}" if username else f"channel:{internal}"
-        return kind, f"channel_{peer_id}", target, username or f"channel_{internal}"
-    sys.exit(f"Unsupported peer type: {type(entity).__name__}")
+        return Peer(kind, f"channel_{peer_id}", target, username or f"channel_{internal}")
+    raise ValueError(f"unsupported peer type {type(entity).__name__}")
 
 
 HISTORY_FOLDER = re.compile(r"^(?:saved_messages|user_(\d+)|chat_(-\d+)|channel_(-100\d+))$")
@@ -296,7 +307,15 @@ async def save_media(client, message, channel_folder):
         if args.skip_vid and is_video(media):
             continue
         index = i if len(items) > 1 else None
-        await client.download_media(media, media_path(message, media, channel_folder, index))
+        path = media_path(message, media, channel_folder, index)
+        part = path + ".part"  # so an interrupted download is never mistaken for a finished file
+        try:
+            await client.download_media(media, part)
+            os.replace(part, path)
+        except BaseException:
+            if os.path.exists(part):
+                os.remove(part)
+            raise
 
 
 async def download_message(client, message, channel_folder, with_header, semaphore,
@@ -402,10 +421,10 @@ async def full_info(client, entity):
     return full.about, extra
 
 
-async def write_info(client, entity, folder, kind, target, internal_name):
+async def write_info(client, entity, peer, folder):
     """Write 00-info.txt and the profile picture into the folder. Overwrites each run."""
     about, extra = await full_info(client, entity)
-    rows = {"kind": kind, "name": utils.get_display_name(entity), "target": target,
+    rows = {"kind": peer.kind, "name": utils.get_display_name(entity), "target": peer.target,
             "username": getattr(entity, "username", None), "id": utils.get_peer_id(entity)}
     if isinstance(entity, User):
         rows.update({"first name": entity.first_name, "last name": entity.last_name,
@@ -425,7 +444,7 @@ async def write_info(client, entity, folder, kind, target, internal_name):
     with open(os.path.join(folder, f"{INFO_PREFIX}info.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-    pic = os.path.join(folder, f"{INFO_PREFIX}{internal_name}.jpg")
+    pic = os.path.join(folder, f"{INFO_PREFIX}{peer.internal_name}.jpg")
     try:
         saved = await client.download_profile_photo(entity, file=pic, download_big=True)
     except RPCError as e:
@@ -443,17 +462,17 @@ async def update_all(client):
         folder = os.path.join(BASE_FOLDER, name)
         if not os.path.isdir(folder):
             continue
-        peer = peer_from_folder(name)
-        if peer is None:
+        peer_id = peer_from_folder(name)
+        if peer_id is None:
             skipped.append(name)
             continue
         print(f"\n== {name}")
         try:
-            entity = await client.get_entity(peer)
-            kind, _, target, internal_name = describe(entity)
-            print(f"Target: {utils.get_display_name(entity) or peer} ({target})")
-            await write_info(client, entity, folder, kind, target, internal_name)
-            await download_history(client, entity, folder, kind != "channel", None, True)
+            entity = await client.get_entity(peer_id)
+            peer = describe(entity)
+            print(f"Target: {utils.get_display_name(entity) or peer_id} ({peer.target})")
+            await write_info(client, entity, peer, folder)
+            await download_history(client, entity, folder, peer.with_header, None, True)
             updated += 1
         except (ValueError, RPCError) as e:
             print(f"{name}: cannot update: {type(e).__name__}: {e}")
@@ -468,8 +487,11 @@ async def update_all(client):
 async def list_dialogs(client, limit):
     rows = []
     async for dialog in client.iter_dialogs(limit=limit, archived=False):
-        kind, _, target, _ = describe(dialog.entity)
-        rows.append((kind, dialog.name or "(no name)", target))
+        try:
+            peer = describe(dialog.entity)
+        except ValueError:
+            continue  # e.g. a chat we were banned from
+        rows.append((peer.kind, dialog.name or "(no name)", peer.target))
     width = max((len(name) for _, name, _ in rows), default=0)
     for kind, name, target in rows:
         print(f"{kind:<8} {name:<{width}}  {target}")
@@ -477,9 +499,9 @@ async def list_dialogs(client, limit):
 
 async def main():
     aliases = load_aliases()
-    peer = msg_id = None
+    peer_id = msg_id = None
     if args.dialogs is None and not args.update:
-        peer, msg_id = parse_target(args.target, aliases)
+        peer_id, msg_id = parse_target(args.target, aliases)
         if msg_id is not None and (args.new or args.m is not None):
             parser.error("--new and -m do not apply to a single post link")
         if msg_id is None and args.tag != parser.get_default("tag"):
@@ -491,7 +513,7 @@ async def main():
     )
     async with client:
         if not await client.is_user_authorized():
-            sys.exit("Not logged in. Run: python tg_login.py qr")
+            sys.exit("Not logged in. Run: ./tg login qr")
         if args.dialogs is not None:
             await list_dialogs(client, args.dialogs)
             return
@@ -499,27 +521,26 @@ async def main():
             await update_all(client)
             return
         try:
-            entity = await client.get_entity(peer)
+            entity = await client.get_entity(peer_id)
+            peer = describe(entity)
         except (ValueError, RPCError) as e:
-            sys.exit(f"Cannot access {peer!r}: {e}")
-        kind, folder_name, target, internal_name = describe(entity)
-        print(f"Target: {utils.get_display_name(entity) or peer} ({kind} {utils.get_peer_id(entity)})")
-        if msg_id is not None:
-            folder_name = f"{folder_name}-{args.tag}"
+            sys.exit(f"Cannot access {peer_id!r}: {e}")
+        print(f"Target: {utils.get_display_name(entity) or peer_id} ({peer.kind} {utils.get_peer_id(entity)})")
+        folder_name = f"{peer.folder}-{args.tag}" if msg_id is not None else peer.folder
         channel_folder = os.path.join(BASE_FOLDER, folder_name)
-        with_header = kind != "channel"
 
         if (msg_id is None and not args.new and not args.over
                 and get_latest_message_id(channel_folder) is not None):
             sys.exit(f"Error: folder '{channel_folder}' already has messages. "
                      "Use --over to overwrite files or --new to fetch only new messages.")
         os.makedirs(channel_folder, exist_ok=True)
-        await write_info(client, entity, channel_folder, kind, target, internal_name)
+        await write_info(client, entity, peer, channel_folder)
 
         if msg_id is not None:
-            await download_post(client, entity, msg_id, channel_folder, with_header)
+            await download_post(client, entity, msg_id, channel_folder, peer.with_header)
         else:
-            await download_history(client, entity, channel_folder, with_header, args.m, args.new)
+            await download_history(client, entity, channel_folder, peer.with_header,
+                                   args.m, args.new)
 
 
 if __name__ == "__main__":
@@ -527,3 +548,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit("\nAborted.")
+    except FloodWaitError as e:
+        sys.exit(f"Telegram rate limit: wait {e.seconds}s and try again.")
+    except RPCError as e:
+        sys.exit(f"Telegram error: {type(e).__name__}: {e}")

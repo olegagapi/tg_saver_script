@@ -1,9 +1,9 @@
 """Telegram login for history_download.py.
 
-  python tg_login.py status              # show login state
-  python tg_login.py qr                  # scan QR from the app (recommended)
-  python tg_login.py send +380XXXXXXXXX  # request a login code
-  python tg_login.py code 12345          # finish sign-in with the code
+  ./tg login status              # show login state
+  ./tg login qr                  # scan QR from the app (recommended)
+  ./tg login send +380XXXXXXXXX  # request a login code
+  ./tg login code 12345          # finish sign-in with the code
 
 If two-step verification is enabled you are prompted for the password
 (input is hidden). An attempt left unfinished by a previous run is
@@ -20,6 +20,8 @@ import sys
 from datetime import datetime, timezone
 
 import qrcode
+
+os.chdir(os.path.dirname(os.path.abspath(__file__)))  # .env and the session file live here
 
 try:
     from dotenv import load_dotenv
@@ -89,9 +91,9 @@ async def status():
         if os.path.exists(STATE):
             with open(STATE) as f:
                 phone = json.load(f)["phone"]
-            print(f"Pending login code for {phone[:4]}***{phone[-2:]}. Run: python tg_login.py code <code>")
+            print(f"Pending login code for {phone[:4]}***{phone[-2:]}. Run: ./tg login code <code>")
         else:
-            print("Run: python tg_login.py qr")
+            print("Run: ./tg login qr")
         return
 
     me = await client.get_me()
@@ -141,7 +143,7 @@ async def send(phone):
     print(f"Code sent via: {via}" + (f" (expires in {sent.timeout}s)" if sent.timeout else ""))
     if sent.next_type:
         print(f"Fallback available: {type(sent.next_type).__name__.replace('CodeType', '')}")
-    print("Then run: python tg_login.py code <code>")
+    print("Then run: ./tg login code <code>")
 
 
 async def code(value):
@@ -152,7 +154,7 @@ async def code(value):
         with open(STATE) as f:
             st = json.load(f)
     except FileNotFoundError:
-        sys.exit("No pending code request. Run: python tg_login.py send <phone>")
+        sys.exit("No pending code request. Run: ./tg login send <phone>")
     try:
         me = await client.sign_in(st["phone"], value, phone_code_hash=st["hash"])
     except SessionPasswordNeededError:
@@ -161,7 +163,7 @@ async def code(value):
         sys.exit("Wrong code. Check the Telegram service chat and try again.")
     except PhoneCodeExpiredError:
         os.remove(STATE)
-        sys.exit("Code expired. Run: python tg_login.py send <phone>")
+        sys.exit("Code expired. Run: ./tg login send <phone>")
     os.remove(STATE)
     done(me)
 

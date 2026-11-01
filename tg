@@ -1,0 +1,22 @@
+#!/bin/sh
+# Launcher: uses the project's own virtualenv (creating it on first run), so no
+# `source .venv/bin/activate` is needed. Works from any directory.
+#
+#   ./tg --dialogs             list recent chats          ./tg login status
+#   ./tg @channel              download a history         ./tg login qr
+#   ./tg --update              refresh all histories      ./tg --help
+set -e
+here=$(cd "$(dirname "$0")" && pwd)
+py="$here/.venv/bin/python"
+
+if [ ! -x "$py" ]; then
+    echo "Setting up .venv (first run)..." >&2
+    python3 -m venv "$here/.venv"
+    "$py" -m pip install --quiet --upgrade pip
+    "$py" -m pip install --quiet -r "$here/requirements.txt"
+fi
+
+case "$1" in
+    login) shift; exec "$py" "$here/tg_login.py" "$@" ;;
+    *)            exec "$py" "$here/history_download.py" "$@" ;;
+esac
