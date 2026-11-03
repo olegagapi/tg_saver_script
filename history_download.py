@@ -18,15 +18,21 @@
   an alias from aliases.toml, or a t.me link.
 
 Channel posts are saved as bare text; chats get a "date  sender:" header per message.
+An album (several photos sent together) gets a single text file, named after its first item.
 Every folder gets 00-info.txt (name, username, id, description, ...) and the profile
 picture as 00-<username>.jpg, written before any message is fetched.
 
 Single posts are saved to downloads/<peer>-<tag>/ (default tag: posts) so they stay apart
 from full histories. --update refreshes only the plain history folders and skips any
 folder with a -tag suffix.
+
+A run that could not save everything ends with a summary naming what is missing, exits
+with status 1 and leaves 00-failed.txt (message ids) and/or 00-gaps.txt (id ranges that
+were never listed) in the folder. The next --new or --update run retries those first.
 """
 import argparse
 import asyncio
+import logging
 import os
 import re
 import sys
@@ -59,6 +65,12 @@ SESSION = "session_name"
 ALIASES = "aliases.toml"
 BASE_FOLDER = "downloads"
 INFO_PREFIX = "00-"  # sorts before every message id
+FAILED_FILE = f"{INFO_PREFIX}failed.txt"  # ids the last run could not save
+GAPS_FILE = f"{INFO_PREFIX}gaps.txt"      # id ranges the last run never got to list
+
+# Telethon reports dropped connections ("Server closed the connection: ...") and
+# reconnects on its own; prefix its lines so they are not mistaken for ours.
+logging.basicConfig(level=logging.WARNING, format="telethon: %(message)s")
 
 MSG_LINK = re.compile(
     r"^(?:https?://)?t\.me/(?:s/)?(?:c/(\d+)|([A-Za-z]\w{3,}))/(?:\d+/)?(\d+)/?(?:\?.*)?$"
@@ -286,17 +298,37 @@ def message_header(message):
     return "\n".join(lines)
 
 
-def save_text(channel_folder, message, with_header):
-    if not with_header and not message.text:
-        return
-    if with_header and not message.text and not message.media:
-        return  # service messages, nothing to record
-    parts = [message_header(message)] if with_header else []
-    if message.text:
-        parts.append(message.text)
-    with open(os.path.join(channel_folder, f"{message.id}_message.txt"), "w",
+def save_text(channel_folder, group, with_header):
+    """Write the text file for one message, or for one album (a list of messages that
+    share a grouped_id): one file named after the first item, holding the header (chats
+    only) and the caption. Album items without a caption of their own get no file."""
+    first = group[0]
+    text = "\n\n".join(m.text for m in group if m.text)
+    if not text and not (with_header and first.media):
+        return  # a channel post without text, or a service message: nothing to record
+    parts = [message_header(first)] if with_header else []
+    if text:
+        parts.append(text)
+    with open(os.path.join(channel_folder, f"{first.id}_message.txt"), "w",
               encoding="utf-8") as text_file:
         text_file.write("\n\n".join(parts))
+
+
+def same_album(a, b):
+    return a.grouped_id is not None and a.grouped_id == b.grouped_id
+
+
+def album_safe_chunks(messages, size):
+    """Split into batches of about `size` messages without cutting an album in two,
+    so that every album is saved as one unit by a single download_all() call."""
+    batch = []
+    for message in messages:
+        if len(batch) >= size and not same_album(batch[-1], message):
+            yield batch
+            batch = []
+        batch.append(message)
+    if batch:
+        yield batch
 
 
 async def save_media(client, message, channel_folder):
@@ -318,34 +350,94 @@ async def save_media(client, message, channel_folder):
             raise
 
 
+def read_state(folder):
+    """What earlier runs left undone: (failed ids, gaps). A gap (below, above) means the
+    messages with above < id < below were never listed because a run stopped early."""
+    def rows(name):
+        try:
+            with open(os.path.join(folder, name), encoding="utf-8") as f:
+                return [line.split() for line in f if line.strip() and not line.startswith("#")]
+        except FileNotFoundError:
+            return []
+    failed = {int(row[0]) for row in rows(FAILED_FILE)}
+    gaps = [(int(below), int(above)) for below, above in rows(GAPS_FILE)]
+    return failed, gaps
+
+
+def write_state(folder, failed, gaps):
+    """Persist what is still missing so the next --new run retries it; nothing -> no file."""
+    files = {
+        FAILED_FILE: ("# Messages that could not be saved. `./tg <target> --new` retries them.",
+                      [str(i) for i in sorted(failed)]),
+        GAPS_FILE: ("# Id ranges never listed because a run stopped early, as `below above`:\n"
+                    "# messages with above < id < below are missing (0 = no bound).\n"
+                    "# `./tg <target> --new` fills them.",
+                    [f"{below} {above}" for below, above in gaps]),
+    }
+    for name, (header, lines) in files.items():
+        path = os.path.join(folder, name)
+        if lines:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join([header, *lines]) + "\n")
+        elif os.path.exists(path):
+            os.remove(path)
+
+
+# Errors that end a listing: the connection is gone, Telegram refused the request, or
+# Telethon gave up on it after its own retries (which surfaces as a bare ValueError).
+LISTING_ERRORS = (ConnectionError, RPCError, ValueError, OSError)
+
+
 async def download_message(client, message, channel_folder, with_header, semaphore,
-                           max_retries=3):
+                           text_group=None, max_retries=3):
+    """Save one message. text_group is the list of messages whose text file this one
+    writes (itself, or the whole album it opens); None when another item does it.
+    Returns the message id, or None after reporting why it failed.
+    Never raises: one broken message must not take the whole run down."""
     async with semaphore:
-        for attempt in range(max_retries):
+        attempt = 0
+        while attempt < max_retries:
             try:
-                save_text(channel_folder, message, with_header)
+                if text_group:
+                    save_text(channel_folder, text_group, with_header)
                 await save_media(client, message, channel_folder)
                 return message.id
-            except FloodWaitError as e:
-                print(f"FloodWaitError on message {message.id}, sleeping {e.seconds}s...")
+            except FloodWaitError as e:  # waiting is not an attempt
+                print(f"Message {message.id}: flood wait, sleeping {e.seconds}s...")
                 await asyncio.sleep(e.seconds)
             except (TimeoutError, ConnectionError) as e:
-                if attempt < max_retries - 1:
+                if not client.is_connected():  # Telethon gave up reconnecting
+                    print(f"Message {message.id}: connection to Telegram is gone")
+                    return None
+                attempt += 1
+                if attempt < max_retries:
                     wait = 2 ** attempt
-                    print(f"{type(e).__name__} on message {message.id}, retrying in {wait}s...")
+                    print(f"Message {message.id}: {type(e).__name__}, retrying in {wait}s...")
                     await asyncio.sleep(wait)
-            except (RPCError, OSError) as e:
-                print(f"Error on message {message.id}: {type(e).__name__}: {e}")
+            except (RPCError, OSError, ValueError) as e:
+                print(f"Message {message.id}: {type(e).__name__}: {e}")
                 return None
-        print(f"Failed to download message {message.id} after {max_retries} retries")
+            except Exception as e:  # noqa: BLE001 - reported in the summary instead of a traceback
+                print(f"Message {message.id}: unexpected {type(e).__name__}: {e}")
+                return None
+        print(f"Message {message.id}: giving up after {max_retries} connection errors")
         return None
 
 
 async def download_all(client, messages, channel_folder, with_header):
     """Download a list of messages concurrently. Returns (succeeded, failed_ids)."""
+    groups = {}  # an album is one group; a lone message is a group of its own
+    for msg in messages:
+        groups.setdefault(("album", msg.grouped_id) if msg.grouped_id else ("msg", msg.id),
+                          []).append(msg)
+    text_groups = {}  # id of the first item -> its group
+    for group in groups.values():
+        group.sort(key=lambda m: m.id)
+        text_groups[group[0].id] = group
     semaphore = asyncio.Semaphore(args.jobs)
     results = await asyncio.gather(
-        *(download_message(client, msg, channel_folder, with_header, semaphore)
+        *(download_message(client, msg, channel_folder, with_header, semaphore,
+                           text_groups.get(msg.id))
           for msg in messages)
     )
     failed = [msg.id for msg, ok in zip(messages, results) if ok is None]
@@ -353,6 +445,7 @@ async def download_all(client, messages, channel_folder, with_header):
 
 
 async def download_post(client, entity, msg_id, channel_folder, with_header):
+    """Returns True when every message of the post was saved."""
     message = await client.get_messages(entity, ids=msg_id)
     if message is None:
         sys.exit(f"Message {msg_id} not found in this channel.")
@@ -364,10 +457,15 @@ async def download_post(client, entity, msg_id, channel_folder, with_header):
     succeeded, failed = await download_all(client, messages, channel_folder, with_header)
     print(f"Done: {succeeded}/{len(messages)} messages saved to {channel_folder}")
     if failed:
-        print(f"Failed message IDs: {failed}")
+        print(f"NOT saved: {failed}. Run the same link again to retry.")
+    return not failed
 
 
 async def download_history(client, entity, channel_folder, with_header, min_id, resume):
+    """Download the history and whatever earlier runs left undone (when resuming).
+    Returns True when the folder is complete; otherwise the summary says what is
+    missing and the state files let the next --new run pick it up."""
+    failed, gaps = read_state(channel_folder) if resume else (set(), [])
     if resume:
         latest_id = get_latest_message_id(channel_folder)
         if latest_id is not None:
@@ -375,32 +473,72 @@ async def download_history(client, entity, channel_folder, with_header, min_id, 
             print(f"Resuming from message ID {latest_id}")
         else:
             print("Warning: no existing downloads found, downloading everything")
+    min_id = min_id or 0
 
-    iter_kwargs = {"min_id": min_id} if min_id is not None else {}
     batch_size = args.jobs * 5
     total = succeeded = 0
-    failed_ids = []
+    now_failed = []
+    stopped = None      # why a listing ended early, if it did
+    in_progress = None  # [below, above] of the range being listed right now
 
     async def flush(batch):
         nonlocal total, succeeded
-        ok, failed = await download_all(client, batch, channel_folder, with_header)
+        ok, bad = await download_all(client, batch, channel_folder, with_header)
         total += len(batch)
         succeeded += ok
-        failed_ids.extend(failed)
-        print(f"Progress: {total} messages processed")
+        now_failed.extend(bad)
+        tail = f", {len(now_failed)} failed" if now_failed else ""
+        print(f"Progress: {total} messages processed{tail}")
 
-    batch = []
-    async for message in client.iter_messages(entity, **iter_kwargs):
-        batch.append(message)
-        if len(batch) >= batch_size:
+    async def list_range(below, above):
+        """Newest first, from just below `below` (0 = the top) down to just above `above`.
+        in_progress[0] tracks the lowest id fully handled, so an interrupted listing
+        can resume exactly there."""
+        nonlocal in_progress
+        in_progress = [below, above]
+        batch = []
+        async for message in client.iter_messages(entity, offset_id=below, min_id=above):
+            if len(batch) >= batch_size and not same_album(batch[-1], message):
+                await flush(batch)
+                in_progress[0], batch = batch[-1].id, []
+                if not client.is_connected():
+                    raise ConnectionError("connection to Telegram is gone")
+            batch.append(message)
+        if batch:
             await flush(batch)
-            batch = []
-    if batch:
-        await flush(batch)
+        in_progress = None
 
-    print(f"\nDone: {succeeded}/{total} messages downloaded to {channel_folder}")
-    if failed_ids:
-        print(f"Failed message IDs: {failed_ids}")
+    todo = gaps + [(0, min_id)]  # old gaps first, then the new messages
+    try:
+        if failed:
+            print(f"Retrying {len(failed)} message(s) that failed last time")
+            found = [m for m in await client.get_messages(entity, ids=sorted(failed)) if m]
+            if len(found) < len(failed):
+                print(f"{len(failed) - len(found)} of them no longer exist")
+            failed = {m.id for m in found}
+            for chunk in album_safe_chunks(found, batch_size):
+                await flush(chunk)
+                failed -= {m.id for m in chunk}  # whatever failed again is in now_failed
+        if gaps:
+            print(f"Filling {len(gaps)} gap(s) left by runs that stopped early")
+        while todo:
+            await list_range(*todo.pop(0))
+    except LISTING_ERRORS as e:
+        stopped = f"{type(e).__name__}: {e}"
+        print(f"Listing stopped early: {stopped}")
+    finally:
+        # Runs on Ctrl-C too, so an aborted run can always be continued with --new.
+        gaps = ([tuple(in_progress)] if in_progress else []) + todo
+        failed |= set(now_failed)
+        write_state(channel_folder, failed, gaps)
+        print(f"\nDone: {succeeded}/{total} messages downloaded to {channel_folder}")
+        if failed:
+            print(f"NOT saved: {len(failed)} message(s), ids in {channel_folder}/{FAILED_FILE}")
+        if gaps:
+            print(f"NOT listed: {len(gaps)} id range(s), see {channel_folder}/{GAPS_FILE}")
+        if failed or gaps:
+            print("Run again with --new to retry what is missing.")
+    return not (failed or gaps)
 
 
 async def full_info(client, entity):
@@ -457,7 +595,7 @@ async def write_info(client, entity, peer, folder):
 async def update_all(client):
     if not os.path.isdir(BASE_FOLDER):
         sys.exit(f"Nothing downloaded yet: no {BASE_FOLDER}/ folder.")
-    updated, skipped, failed = 0, [], []
+    updated, incomplete, skipped, failed = 0, [], [], []
     for name in sorted(os.listdir(BASE_FOLDER)):
         folder = os.path.join(BASE_FOLDER, name)
         if not os.path.isdir(folder):
@@ -467,21 +605,30 @@ async def update_all(client):
             skipped.append(name)
             continue
         print(f"\n== {name}")
+        if not client.is_connected():
+            print("connection to Telegram is gone, not trying")
+            failed.append(name)
+            continue
         try:
             entity = await client.get_entity(peer_id)
             peer = describe(entity)
             print(f"Target: {utils.get_display_name(entity) or peer_id} ({peer.target})")
             await write_info(client, entity, peer, folder)
-            await download_history(client, entity, folder, peer.with_header, None, True)
-            updated += 1
-        except (ValueError, RPCError) as e:
+            if await download_history(client, entity, folder, peer.with_header, None, True):
+                updated += 1
+            else:
+                incomplete.append(name)
+        except (ValueError, ConnectionError, RPCError) as e:
             print(f"{name}: cannot update: {type(e).__name__}: {e}")
             failed.append(name)
     print(f"\nUpdated {updated} folder(s).")
     if skipped:
         print(f"Skipped (not a history folder): {', '.join(skipped)}")
+    if incomplete:
+        print(f"Incomplete (run --update again to retry): {', '.join(incomplete)}")
     if failed:
         print(f"Failed: {', '.join(failed)}")
+    return not (incomplete or failed)
 
 
 async def list_dialogs(client, limit):
@@ -516,10 +663,9 @@ async def main():
             sys.exit("Not logged in. Run: ./tg login qr")
         if args.dialogs is not None:
             await list_dialogs(client, args.dialogs)
-            return
+            return True
         if args.update:
-            await update_all(client)
-            return
+            return await update_all(client)
         try:
             entity = await client.get_entity(peer_id)
             peer = describe(entity)
@@ -537,18 +683,20 @@ async def main():
         await write_info(client, entity, peer, channel_folder)
 
         if msg_id is not None:
-            await download_post(client, entity, msg_id, channel_folder, peer.with_header)
-        else:
-            await download_history(client, entity, channel_folder, peer.with_header,
-                                   args.m, args.new)
+            return await download_post(client, entity, msg_id, channel_folder, peer.with_header)
+        return await download_history(client, entity, channel_folder, peer.with_header,
+                                      args.m, args.new)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        complete = asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit("\nAborted.")
     except FloodWaitError as e:
         sys.exit(f"Telegram rate limit: wait {e.seconds}s and try again.")
     except RPCError as e:
         sys.exit(f"Telegram error: {type(e).__name__}: {e}")
+    except ConnectionError as e:
+        sys.exit(f"Cannot reach Telegram: {e}")
+    sys.exit(0 if complete else 1)

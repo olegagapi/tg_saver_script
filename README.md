@@ -78,10 +78,36 @@ Each folder holds:
   and sort before all messages.
 - `<id>_message.txt` per message. Channel posts are bare text. In chats the
   file starts with `date  sender:` and, for forwards, a `forwarded from` line.
+  An album (several photos sent at once) gets one such file, named after its
+  first item; the other items have only their media file.
 - `<id>_media.jpg` / `.mp4` for photos and videos, `<id>_<filename>` for other
   documents, `<id>_media_1.jpg` ... for paid posts with several items.
+- `00-failed.txt` and `00-gaps.txt` only while something is missing, see below.
 
 `--update` and `--new` resume from the highest message id in the folder.
 Folders with a `-tag` suffix are never touched by `--update`, so they are
 safe for hand-picked posts. Paid posts download only after you have bought
 them in the app. Before that the script saves the text and tells you the price.
+
+## When something goes wrong
+
+Lines starting with `telethon:` come from the Telegram library. `Server closed
+the connection: [Errno 54] Connection reset by peer` means the connection
+dropped; the library reconnects by itself and resends whatever was in flight,
+so a few of these are harmless. Only the summary at the end tells you whether
+anything was actually lost.
+
+Every run ends with `Done: <saved>/<seen> messages downloaded to <folder>`. If
+the two numbers differ, or the listing itself stopped early, the run says so,
+exits with status 1 and leaves a record in the folder:
+
+- `00-failed.txt`: ids of messages whose text or media could not be saved after
+  the retries (a note is printed for each one as it happens).
+- `00-gaps.txt`: id ranges that were never listed because the connection died
+  or Telegram kept refusing the request mid-way. Also written when you press
+  Ctrl-C, so an aborted download can be continued.
+
+The next `./tg <target> --new` (or `./tg --update`) retries those first and then
+fetches the new messages. Once everything is saved the two files disappear.
+Messages that were deleted in the meantime are dropped from the list. For a
+single post link just run the same link again.
